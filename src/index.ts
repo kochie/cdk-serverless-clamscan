@@ -1,39 +1,61 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import * as path from 'path';
-import {
-  CustomResource, Duration, RemovalPolicy,
-  Stack,
-} from 'aws-cdk-lib';
+import * as path from "path";
+import { CustomResource, Duration, RemovalPolicy, Stack } from "aws-cdk-lib";
 import {
   GatewayVpcEndpoint,
   GatewayVpcEndpointAwsService,
+  IVpc,
   Port,
-  SecurityGroup, SubnetType, Vpc,
-} from 'aws-cdk-lib/aws-ec2';
-import { FileSystem, LifecyclePolicy, PerformanceMode } from 'aws-cdk-lib/aws-efs';
-import { EventBus, Rule, Schedule } from 'aws-cdk-lib/aws-events';
-import { LambdaFunction } from 'aws-cdk-lib/aws-events-targets';
+  SecurityGroup,
+  SubnetType,
+  Vpc,
+} from "aws-cdk-lib/aws-ec2";
+import {
+  FileSystem,
+  LifecyclePolicy,
+  PerformanceMode,
+} from "aws-cdk-lib/aws-efs";
+import { EventBus, Rule, Schedule } from "aws-cdk-lib/aws-events";
+import { LambdaFunction } from "aws-cdk-lib/aws-events-targets";
 import {
   AccountRootPrincipal,
-  AddToResourcePolicyResult, AnyPrincipal, ArnPrincipal, Effect,
+  AddToResourcePolicyResult,
+  AnyPrincipal,
+  ArnPrincipal,
+  Effect,
   PolicyStatement,
-} from 'aws-cdk-lib/aws-iam';
+} from "aws-cdk-lib/aws-iam";
 import {
-  Code, DockerImageCode,
-  DockerImageFunction, FileSystem as LambdaFileSystem, Function,
-  IDestination, Runtime,
-} from 'aws-cdk-lib/aws-lambda';
+  Code,
+  DockerImageCode,
+  DockerImageFunction,
+  FileSystem as LambdaFileSystem,
+  Function,
+  IDestination,
+  Runtime,
+} from "aws-cdk-lib/aws-lambda";
 import {
   EventBridgeDestination,
   SqsDestination,
-} from 'aws-cdk-lib/aws-lambda-destinations';
-import { Bucket, BucketEncryption, EventType, IBucket } from 'aws-cdk-lib/aws-s3';
-import { LambdaDestination } from 'aws-cdk-lib/aws-s3-notifications';
-import { Queue, QueueEncryption } from 'aws-cdk-lib/aws-sqs';
-import { NagSuppressions } from 'cdk-nag';
-import { Construct } from 'constructs';
+} from "aws-cdk-lib/aws-lambda-destinations";
+import {
+  Bucket,
+  BucketEncryption,
+  EventType,
+  IBucket,
+} from "aws-cdk-lib/aws-s3";
+import { Queue, QueueEncryption } from "aws-cdk-lib/aws-sqs";
+import { NagSuppressions } from "cdk-nag";
+import { Construct } from "constructs";
+import {
+  FilterPattern,
+  ILogGroup,
+  SubscriptionFilter,
+} from "aws-cdk-lib/aws-logs";
+import { LambdaDestination } from "aws-cdk-lib/aws-logs-destinations";
+import { AttributeType, Table } from "aws-cdk-lib/aws-dynamodb";
 
 /**
  * Interface for ServerlessClamscan Virus Definitions S3 Bucket Logging.
@@ -83,6 +105,8 @@ export interface ServerlessClamscanProps {
    * Allows the use of imported buckets. When using imported buckets the user is responsible for adding the required policy statement to the bucket policy: `getPolicyStatementForBucket()` can be used to retrieve the policy statement required by the solution.
    */
   readonly acceptResponsibilityForUsingImportedBucket?: boolean;
+
+  readonly fsxLogGroup: ILogGroup;
 }
 
 /**
@@ -167,9 +191,10 @@ export class ServerlessClamscan extends Construct {
 
   private _scanFunction: DockerImageFunction;
   private _s3Gw: GatewayVpcEndpoint;
-  private _efsRootPath = '/lambda';
+  private _efsRootPath = "/lambda";
   private _efsMountPath = `/mnt${this._efsRootPath}`;
-  private _efsDefsPath = 'virus_database/';
+  private _efsDefsPath = "virus_database/";
+  private _vpc: IVpc;
 
   /**
    * Creates a ServerlessClamscan construct.
@@ -183,28 +208,28 @@ export class ServerlessClamscan extends Construct {
     this.useImportedBuckets = props.acceptResponsibilityForUsingImportedBucket;
 
     if (!props.onResult) {
-      this.resultBus = new EventBus(this, 'ScanResultBus');
+      this.resultBus = new EventBus(this, "ScanResultBus");
       this.resultDest = new EventBridgeDestination(this.resultBus);
-      this.infectedRule = new Rule(this, 'InfectedRule', {
+      this.infectedRule = new Rule(this, "InfectedRule", {
         eventBus: this.resultBus,
-        description: 'Event for when a file is marked INFECTED',
+        description: "Event for when a file is marked INFECTED",
         eventPattern: {
           detail: {
             responsePayload: {
-              source: ['serverless-clamscan'],
-              status: ['INFECTED'],
+              source: ["serverless-clamscan"],
+              status: ["INFECTED"],
             },
           },
         },
       });
-      this.cleanRule = new Rule(this, 'CleanRule', {
+      this.cleanRule = new Rule(this, "CleanRule", {
         eventBus: this.resultBus,
-        description: 'Event for when a file is marked CLEAN',
+        description: "Event for when a file is marked CLEAN",
         eventPattern: {
           detail: {
             responsePayload: {
-              source: ['serverless-clamscan'],
-              status: ['CLEAN'],
+              source: ["serverless-clamscan"],
+              status: ["CLEAN"],
             },
           },
         },
@@ -214,74 +239,83 @@ export class ServerlessClamscan extends Construct {
     }
 
     if (!props.onError) {
-      this.errorDeadLetterQueue = new Queue(this, 'ScanErrorDeadLetterQueue', {
+      this.errorDeadLetterQueue = new Queue(this, "ScanErrorDeadLetterQueue", {
         encryption: QueueEncryption.KMS_MANAGED,
       });
-      this.errorDeadLetterQueue.addToResourcePolicy(new PolicyStatement({
-        actions: ['sqs:*'],
-        effect: Effect.DENY,
-        principals: [new AnyPrincipal()],
-        conditions: { Bool: { 'aws:SecureTransport': false } },
-        resources: [this.errorDeadLetterQueue.queueArn],
-      }));
-      this.errorQueue = new Queue(this, 'ScanErrorQueue', {
+      this.errorDeadLetterQueue.addToResourcePolicy(
+        new PolicyStatement({
+          actions: ["sqs:*"],
+          effect: Effect.DENY,
+          principals: [new AnyPrincipal()],
+          conditions: { Bool: { "aws:SecureTransport": false } },
+          resources: [this.errorDeadLetterQueue.queueArn],
+        })
+      );
+      this.errorQueue = new Queue(this, "ScanErrorQueue", {
         encryption: QueueEncryption.KMS_MANAGED,
         deadLetterQueue: {
           maxReceiveCount: 3,
           queue: this.errorDeadLetterQueue,
         },
       });
-      this.errorQueue.addToResourcePolicy(new PolicyStatement({
-        actions: ['sqs:*'],
-        effect: Effect.DENY,
-        principals: [new AnyPrincipal()],
-        conditions: { Bool: { 'aws:SecureTransport': false } },
-        resources: [this.errorQueue.queueArn],
-      }));
+      this.errorQueue.addToResourcePolicy(
+        new PolicyStatement({
+          actions: ["sqs:*"],
+          effect: Effect.DENY,
+          principals: [new AnyPrincipal()],
+          conditions: { Bool: { "aws:SecureTransport": false } },
+          resources: [this.errorQueue.queueArn],
+        })
+      );
       this.errorDest = new SqsDestination(this.errorQueue);
       NagSuppressions.addResourceSuppressions(this.errorDeadLetterQueue, [
-        { id: 'AwsSolutions-SQS3', reason: 'This queue is a DLQ.' },
+        { id: "AwsSolutions-SQS3", reason: "This queue is a DLQ." },
       ]);
     } else {
       this.errorDest = props.onError;
     }
 
-    const vpc = new Vpc(this, 'ScanVPC', {
+    const table = new Table(this, "ScanResults", {
+      partitionKey: { name: "source", type: AttributeType.STRING },
+      sortKey: { name: "object_name", type: AttributeType.STRING },
+    });
+
+    this._vpc = new Vpc(this, "ScanVPC", {
       subnetConfiguration: [
         {
           subnetType: SubnetType.PRIVATE_ISOLATED,
-          name: 'Isolated',
+          name: "Isolated",
         },
       ],
     });
 
-    vpc.addFlowLog('FlowLogs');
+    this._vpc.addFlowLog("FlowLogs");
 
-    this._s3Gw = vpc.addGatewayEndpoint('S3Endpoint', {
+    this._s3Gw = this._vpc.addGatewayEndpoint("S3Endpoint", {
       service: GatewayVpcEndpointAwsService.S3,
     });
 
-    const fileSystem = new FileSystem(this, 'ScanFileSystem', {
-      vpc: vpc,
+    const fileSystem = new FileSystem(this, "ScanFileSystem", {
+      vpc: this._vpc,
       encrypted: props.efsEncryption === false ? false : true,
       lifecyclePolicy: LifecyclePolicy.AFTER_7_DAYS,
       performanceMode: PerformanceMode.GENERAL_PURPOSE,
       removalPolicy: RemovalPolicy.DESTROY,
-      securityGroup: new SecurityGroup(this, 'ScanFileSystemSecurityGroup', {
-        vpc: vpc,
+      securityGroup: new SecurityGroup(this, "ScanFileSystemSecurityGroup", {
+        vpc: this._vpc,
         allowAllOutbound: false,
       }),
     });
 
-    const lambda_ap = fileSystem.addAccessPoint('ScanLambdaAP', {
+    const lambda_ap = fileSystem.addAccessPoint("ScanLambdaAP", {
       createAcl: {
-        ownerGid: '1000',
-        ownerUid: '1000',
-        permissions: '755',
+        ownerGid: "1000",
+        ownerUid: "1000",
+        permissions: "755",
       },
       posixUser: {
-        gid: '1000',
-        uid: '1000',
+        gid: "1000",
+        uid: "1000",
       },
       path: this._efsRootPath,
     });
@@ -291,40 +325,40 @@ export class ServerlessClamscan extends Construct {
     if (logs_bucket === true || logs_bucket === undefined) {
       this.defsAccessLogsBucket = new Bucket(
         this,
-        'VirusDefsAccessLogsBucket',
+        "VirusDefsAccessLogsBucket",
         {
           encryption: BucketEncryption.S3_MANAGED,
           removalPolicy: RemovalPolicy.RETAIN,
-          serverAccessLogsPrefix: 'access-logs-bucket-logs',
+          serverAccessLogsPrefix: "access-logs-bucket-logs",
           blockPublicAccess: {
             blockPublicAcls: true,
             blockPublicPolicy: true,
             ignorePublicAcls: true,
             restrictPublicBuckets: true,
           },
-        },
+        }
       );
       this.defsAccessLogsBucket.addToResourcePolicy(
         new PolicyStatement({
           effect: Effect.DENY,
-          actions: ['s3:*'],
+          actions: ["s3:*"],
           resources: [
-            this.defsAccessLogsBucket.arnForObjects('*'),
+            this.defsAccessLogsBucket.arnForObjects("*"),
             this.defsAccessLogsBucket.bucketArn,
           ],
           principals: [new AnyPrincipal()],
           conditions: {
             Bool: {
-              'aws:SecureTransport': false,
+              "aws:SecureTransport": false,
             },
           },
-        }),
+        })
       );
     } else if (logs_bucket != false) {
       this.defsAccessLogsBucket = logs_bucket;
     }
 
-    const defs_bucket = new Bucket(this, 'VirusDefsBucket', {
+    const defs_bucket = new Bucket(this, "VirusDefsBucket", {
       encryption: BucketEncryption.S3_MANAGED,
       removalPolicy: RemovalPolicy.DESTROY,
       autoDeleteObjects: true,
@@ -342,109 +376,131 @@ export class ServerlessClamscan extends Construct {
     defs_bucket.addToResourcePolicy(
       new PolicyStatement({
         effect: Effect.DENY,
-        actions: ['s3:*'],
-        resources: [defs_bucket.arnForObjects('*'), defs_bucket.bucketArn],
+        actions: ["s3:*"],
+        resources: [defs_bucket.arnForObjects("*"), defs_bucket.bucketArn],
         principals: [new AnyPrincipal()],
         conditions: {
           Bool: {
-            'aws:SecureTransport': false,
+            "aws:SecureTransport": false,
           },
         },
-      }),
+      })
     );
     defs_bucket.addToResourcePolicy(
       new PolicyStatement({
         effect: Effect.ALLOW,
-        actions: ['s3:GetObject', 's3:ListBucket'],
-        resources: [defs_bucket.arnForObjects('*'), defs_bucket.bucketArn],
+        actions: ["s3:GetObject", "s3:ListBucket"],
+        resources: [defs_bucket.arnForObjects("*"), defs_bucket.bucketArn],
         principals: [new AnyPrincipal()],
         conditions: {
           StringEquals: {
-            'aws:SourceVpce': this._s3Gw.vpcEndpointId,
+            "aws:SourceVpce": this._s3Gw.vpcEndpointId,
           },
         },
-      }),
+      })
     );
     defs_bucket.addToResourcePolicy(
       new PolicyStatement({
         effect: Effect.DENY,
-        actions: ['s3:PutBucketPolicy', 's3:DeleteBucketPolicy'],
+        actions: ["s3:PutBucketPolicy", "s3:DeleteBucketPolicy"],
         resources: [defs_bucket.bucketArn],
         notPrincipals: [new AccountRootPrincipal()],
-      }),
+      })
     );
     this._s3Gw.addToPolicy(
       new PolicyStatement({
         effect: Effect.ALLOW,
-        actions: ['s3:GetObject', 's3:ListBucket'],
-        resources: [defs_bucket.arnForObjects('*'), defs_bucket.bucketArn],
+        actions: ["s3:GetObject", "s3:ListBucket"],
+        resources: [defs_bucket.arnForObjects("*"), defs_bucket.bucketArn],
         principals: [new AnyPrincipal()],
-      }),
+      })
     );
 
-    this._scanFunction = new DockerImageFunction(this, 'ServerlessClamscan', {
+    this._scanFunction = new DockerImageFunction(this, "ServerlessClamscan", {
       code: DockerImageCode.fromImageAsset(
-        path.join(__dirname, '../assets/lambda/code/scan'),
+        path.join(__dirname, "../assets/lambda/code/scan"),
         {
           buildArgs: {
             // Only force update the docker layer cache once a day
             CACHE_DATE: new Date().toDateString(),
           },
           extraHash: Date.now().toString(),
-        },
+        }
       ),
       onSuccess: this.resultDest,
       onFailure: this.errorDest,
       filesystem: LambdaFileSystem.fromEfsAccessPoint(
         lambda_ap,
-        this._efsMountPath,
+        this._efsMountPath
       ),
-      vpc: vpc,
-      vpcSubnets: { subnets: vpc.isolatedSubnets },
+      vpc: this._vpc,
+      vpcSubnets: { subnets: this._vpc.isolatedSubnets },
       allowAllOutbound: false,
       timeout: Duration.minutes(15),
       memorySize: 10240,
       reservedConcurrentExecutions: props.reservedConcurrency,
       environment: {
+        TABLE_NAME: table.tableName,
         EFS_MOUNT_PATH: this._efsMountPath,
         EFS_DEF_PATH: this._efsDefsPath,
         DEFS_URL: defs_bucket.virtualHostedUrlForObject(),
-        POWERTOOLS_METRICS_NAMESPACE: 'serverless-clamscan',
-        POWERTOOLS_SERVICE_NAME: 'virus-scan',
+        POWERTOOLS_METRICS_NAMESPACE: "serverless-clamscan",
+        POWERTOOLS_SERVICE_NAME: "virus-scan",
       },
     });
     if (this._scanFunction.role) {
       NagSuppressions.addResourceSuppressions(this._scanFunction.role, [
-        { id: 'AwsSolutions-IAM4', reason: 'The AWSLambdaBasicExecutionRole does not provide permissions beyond uploading logs to CloudWatch. The AWSLambdaVPCAccessExecutionRole is required for functions with VPC access to manage elastic network interfaces.' },
+        {
+          id: "AwsSolutions-IAM4",
+          reason:
+            "The AWSLambdaBasicExecutionRole does not provide permissions beyond uploading logs to CloudWatch. The AWSLambdaVPCAccessExecutionRole is required for functions with VPC access to manage elastic network interfaces.",
+        },
       ]);
-      NagSuppressions.addResourceSuppressions(this._scanFunction.role, [{
-        id: 'AwsSolutions-IAM5',
-        reason:
-          'The EFS mount point permissions are controlled through a condition which limit the scope of the * resources.',
-      }], true);
+      NagSuppressions.addResourceSuppressions(
+        this._scanFunction.role,
+        [
+          {
+            id: "AwsSolutions-IAM5",
+            reason:
+              "The EFS mount point permissions are controlled through a condition which limit the scope of the * resources.",
+          },
+        ],
+        true
+      );
     }
     this._scanFunction.connections.allowToAnyIpv4(
       Port.tcp(443),
-      'Allow outbound HTTPS traffic for S3 access.',
+      "Allow outbound HTTPS traffic for S3 access."
     );
     defs_bucket.grantRead(this._scanFunction);
+    table.grantReadWriteData(this._scanFunction);
 
-    const download_defs = new DockerImageFunction(this, 'DownloadDefs', {
+    if (props.fsxLogGroup) {
+      new SubscriptionFilter(this, "SgAvScanFilter", {
+        logGroup: props.fsxLogGroup,
+        destination: new LambdaDestination(this._scanFunction),
+        filterPattern: FilterPattern.literal(
+          `<Data Name=\"operation\">Create</Data>`
+        ),
+      });
+    }
+
+    const download_defs = new DockerImageFunction(this, "DownloadDefs", {
       code: DockerImageCode.fromImageAsset(
-        path.join(__dirname, '../assets/lambda/code/download_defs'),
+        path.join(__dirname, "../assets/lambda/code/download_defs"),
         {
           buildArgs: {
             // Only force update the docker layer cache once a day
             CACHE_DATE: new Date().toDateString(),
           },
           extraHash: Date.now().toString(),
-        },
+        }
       ),
       timeout: Duration.minutes(5),
       memorySize: 1024,
       environment: {
         DEFS_BUCKET: defs_bucket.bucketName,
-        POWERTOOLS_SERVICE_NAME: 'freshclam-update',
+        POWERTOOLS_SERVICE_NAME: "freshclam-update",
       },
     });
     const stack = Stack.of(this);
@@ -452,51 +508,61 @@ export class ServerlessClamscan extends Construct {
     if (download_defs.role) {
       const download_defs_role = `arn:${stack.partition}:sts::${stack.account}:assumed-role/${download_defs.role.roleName}/${download_defs.functionName}`;
       const download_defs_assumed_principal = new ArnPrincipal(
-        download_defs_role,
+        download_defs_role
       );
       defs_bucket.addToResourcePolicy(
         new PolicyStatement({
           effect: Effect.DENY,
-          actions: ['s3:PutObject*'],
-          resources: [defs_bucket.arnForObjects('*')],
+          actions: ["s3:PutObject*"],
+          resources: [defs_bucket.arnForObjects("*")],
           notPrincipals: [download_defs.role, download_defs_assumed_principal],
-        }),
+        })
       );
       defs_bucket.grantReadWrite(download_defs);
-      NagSuppressions.addResourceSuppressions(download_defs.role, [{
-        id: 'AwsSolutions-IAM4',
-        reason:
-          'The AWSLambdaBasicExecutionRole does not provide permissions beyond uploading logs to CloudWatch.',
-      }]);
-      NagSuppressions.addResourceSuppressions(download_defs.role, [{
-        id: 'AwsSolutions-IAM5',
-        reason:
-          'The function is allowed to perform operations on all prefixes in the specified bucket.',
-      }], true);
+      NagSuppressions.addResourceSuppressions(download_defs.role, [
+        {
+          id: "AwsSolutions-IAM4",
+          reason:
+            "The AWSLambdaBasicExecutionRole does not provide permissions beyond uploading logs to CloudWatch.",
+        },
+      ]);
+      NagSuppressions.addResourceSuppressions(
+        download_defs.role,
+        [
+          {
+            id: "AwsSolutions-IAM5",
+            reason:
+              "The function is allowed to perform operations on all prefixes in the specified bucket.",
+          },
+        ],
+        true
+      );
     }
 
-    new Rule(this, 'VirusDefsUpdateRule', {
+    new Rule(this, "VirusDefsUpdateRule", {
       schedule: Schedule.rate(Duration.hours(12)),
       targets: [new LambdaFunction(download_defs)],
     });
 
-    const init_defs_cr = new Function(this, 'InitDefs', {
+    const init_defs_cr = new Function(this, "InitDefs", {
       runtime: Runtime.PYTHON_3_9,
       code: Code.fromAsset(
-        path.join(__dirname, '../assets/lambda/code/initialize_defs_cr'),
+        path.join(__dirname, "../assets/lambda/code/initialize_defs_cr")
       ),
-      handler: 'lambda.lambda_handler',
+      handler: "lambda.lambda_handler",
       timeout: Duration.minutes(5),
     });
     download_defs.grantInvoke(init_defs_cr);
     if (init_defs_cr.role) {
-      NagSuppressions.addResourceSuppressions(init_defs_cr.role, [{
-        id: 'AwsSolutions-IAM4',
-        reason:
-          'The AWSLambdaBasicExecutionRole does not provide permissions beyond uploading logs to CloudWatch.',
-      }]);
+      NagSuppressions.addResourceSuppressions(init_defs_cr.role, [
+        {
+          id: "AwsSolutions-IAM4",
+          reason:
+            "The AWSLambdaBasicExecutionRole does not provide permissions beyond uploading logs to CloudWatch.",
+        },
+      ]);
     }
-    new CustomResource(this, 'InitDefsCr', {
+    new CustomResource(this, "InitDefsCr", {
       serviceToken: init_defs_cr.functionArn,
       properties: {
         FnName: download_defs.functionName,
@@ -519,10 +585,9 @@ export class ServerlessClamscan extends Construct {
       const scan_assumed_role = `arn:${stack.partition}:sts::${stack.account}:assumed-role/${this._scanFunction.role.roleName}/${this._scanFunction.functionName}`;
       return new ArnPrincipal(scan_assumed_role);
     } else {
-      throw new Error('The scan function role is undefined');
+      throw new Error("The scan function role is undefined");
     }
   }
-
 
   /**
    * Returns the statement that should be added to the bucket policy
@@ -537,23 +602,31 @@ export class ServerlessClamscan extends Construct {
       const scan_assumed_principal = this.scanAssumedPrincipal;
       return new PolicyStatement({
         effect: Effect.DENY,
-        actions: ['s3:GetObject'],
-        resources: [bucket.arnForObjects('*')],
+        actions: ["s3:GetObject"],
+        resources: [bucket.arnForObjects("*")],
         notPrincipals: [this._scanFunction.role, scan_assumed_principal],
         conditions: {
           StringEquals: {
-            's3:ExistingObjectTag/scan-status': [
-              'IN PROGRESS',
-              'INFECTED',
-              'ERROR',
+            "s3:ExistingObjectTag/scan-status": [
+              "IN PROGRESS",
+              "INFECTED",
+              "ERROR",
             ],
           },
         },
       });
     } else {
-      throw new Error("Can't generate a valid S3 bucket policy, the scan function role is undefined");
+      throw new Error(
+        "Can't generate a valid S3 bucket policy, the scan function role is undefined"
+      );
     }
   }
+
+  addRule(rule: Rule) {
+    rule.addTarget(new LambdaFunction(this._scanFunction));
+  }
+
+  addPeer(vpc: IVpc) {}
 
   /**
    * Sets the specified S3 Bucket as a s3:ObjectCreate* for the ClamAV function.
@@ -562,18 +635,18 @@ export class ServerlessClamscan extends Construct {
    * @param bucket The bucket to add the scanning bucket policy and s3:ObjectCreate* trigger to.
    */
   addSourceBucket(bucket: IBucket) {
-    bucket.addEventNotification(
-      EventType.OBJECT_CREATED,
-      new LambdaDestination(this._scanFunction),
-    );
+    // bucket.addEventNotification(
+    //   EventType.OBJECT_CREATED,
+    //   new LambdaDestination(this._scanFunction)
+    // );
 
     bucket.grantRead(this._scanFunction);
     this._scanFunction.addToRolePolicy(
       new PolicyStatement({
         effect: Effect.ALLOW,
-        actions: ['s3:PutObjectTagging', 's3:PutObjectVersionTagging'],
-        resources: [bucket.arnForObjects('*')],
-      }),
+        actions: ["s3:PutObjectTagging", "s3:PutObjectVersionTagging"],
+        resources: [bucket.arnForObjects("*")],
+      })
     );
 
     if (this._scanFunction.role) {
@@ -581,26 +654,28 @@ export class ServerlessClamscan extends Construct {
       this._s3Gw.addToPolicy(
         new PolicyStatement({
           effect: Effect.ALLOW,
-          actions: ['s3:GetObject*', 's3:GetBucket*', 's3:List*'],
-          resources: [bucket.bucketArn, bucket.arnForObjects('*')],
+          actions: ["s3:GetObject*", "s3:GetBucket*", "s3:List*"],
+          resources: [bucket.bucketArn, bucket.arnForObjects("*")],
           principals: [this._scanFunction.role, scan_assumed_principal],
-        }),
+        })
       );
       this._s3Gw.addToPolicy(
         new PolicyStatement({
           effect: Effect.ALLOW,
-          actions: ['s3:PutObjectTagging', 's3:PutObjectVersionTagging'],
-          resources: [bucket.arnForObjects('*')],
+          actions: ["s3:PutObjectTagging", "s3:PutObjectVersionTagging"],
+          resources: [bucket.arnForObjects("*")],
           principals: [this._scanFunction.role, scan_assumed_principal],
-        }),
+        })
       );
 
       const result: AddToResourcePolicyResult = bucket.addToResourcePolicy(
-        this.getPolicyStatementForBucket(bucket),
+        this.getPolicyStatementForBucket(bucket)
       );
 
       if (!result.statementAdded && !this.useImportedBuckets) {
-        throw new Error('acceptResponsibilityForUsingImportedBucket must be set when adding an imported bucket. When using imported buckets the user is responsible for adding the required policy statement to the bucket policy: `getPolicyStatementForBucket()` can be used to retrieve the policy statement required by the solution');
+        throw new Error(
+          "acceptResponsibilityForUsingImportedBucket must be set when adding an imported bucket. When using imported buckets the user is responsible for adding the required policy statement to the bucket policy: `getPolicyStatementForBucket()` can be used to retrieve the policy statement required by the solution"
+        );
       }
     }
   }

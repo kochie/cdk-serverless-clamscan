@@ -6,13 +6,14 @@ LABEL name=lambda/python/clamav
 LABEL version=1.0
 
 ARG CACHE_DATE=1
-RUN yum update -y \
-    && yum install -y amazon-linux-extras \
-    && PYTHON=python2 amazon-linux-extras install epel \
-    && yum -y install clamav clamd p7zip \
-    && yum clean all \
-    && pip3 install --no-cache-dir cffi awslambdaric boto3 requests aws-lambda-powertools \
-    && ln -s /etc/freshclam.conf /tmp/freshclam.conf
+RUN yum update -y
+RUN yum install -y amazon-linux-extras
+RUN PYTHON=python2 amazon-linux-extras install epel
+RUN yum -y install clamav clamd p7zip
+RUN yum clean all
+RUN yum -y install gcc python-devel krb5-devel krb5-workstation python-devel
+RUN pip3 install --no-cache-dir cffi awslambdaric boto3 requests aws-lambda-powertools smbprotocol[kerberos]
+RUN ln -s /etc/freshclam.conf /tmp/freshclam.conf
 
 COPY clamd.conf /etc/clamd.conf
 COPY lambda.py /var/task/lambda.py

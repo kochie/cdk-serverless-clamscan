@@ -11,14 +11,34 @@ import os
 import pwd
 import subprocess
 import shutil
+import base64
+import json
+import gzip
+import io
+import uuid
 from urllib.parse import unquote_plus
+import xml.etree.ElementTree as ET
 from aws_lambda_powertools import Logger, Metrics
+
+try:
+    from gssapi.raw import inquire_sec_context_by_oid
+    print("python-gssapi extension is available")
+except ImportError as exc:
+    print("python-gssapi extension is not available: %s" % str(exc))
+
+from smbclient import (
+    open_file,
+    stat
+)
 
 logger = Logger()
 metrics = Metrics()
 
 s3_resource = boto3.resource("s3")
 s3_client = boto3.client("s3")
+
+dynamo_client = boto3.client("dynamodb")
+dynamo_resource = boto3.resource("dynamodb")
 
 INPROGRESS = "IN PROGRESS"
 CLEAN = "CLEAN"
@@ -63,72 +83,110 @@ class FileTooBigException(Exception):
 @logger.inject_lambda_context(log_event=True)
 def lambda_handler(event, context):
     logger.info(json.dumps(event))
-    bucket_info = event["Records"][0]["s3"]
-    input_bucket = bucket_info["bucket"]["name"]
-    input_key = unquote_plus(bucket_info["object"]["key"])
-    summary = ""
-    if not input_key.endswith("/"):
-        mount_path = os.environ["EFS_MOUNT_PATH"]
-        definitions_path = f"{mount_path}/{os.environ['EFS_DEF_PATH']}"
-        payload_path = f"{mount_path}/{context.aws_request_id}"
-        tmp_path = f"{payload_path}-tmp"
-        set_status(input_bucket, input_key, INPROGRESS)
-        create_dir(input_bucket, input_key, payload_path)
-        create_dir(input_bucket, input_key, tmp_path)
-        download_object(input_bucket, input_key, payload_path)
-        expand_if_large_archive(
-            input_bucket,
-            input_key,
-            payload_path,
-            bucket_info["object"]["size"],
+
+    # bucket_info = event["Records"][0]["s3"]
+    # input_bucket = bucket_info["bucket"]["name"]
+    # input_key = unquote_plus(bucket_info["object"]["key"])
+
+    data = event["awslogs"]["data"]
+
+    log_object = json.load(
+        io.BytesIO(
+            gzip.decompress(
+                base64.b64decode(data)
+            )
         )
-        create_dir(input_bucket, input_key, definitions_path)
-        freshclam_update(
-            input_bucket, input_key, payload_path, definitions_path
-        )
-        summary = scan(
-            input_bucket, input_key, payload_path, definitions_path, tmp_path
-        )
-        delete(payload_path)
-        delete(tmp_path)
-    else:
-        summary = {
-            "source": "serverless-clamscan",
-            "input_bucket": input_bucket,
-            "input_key": input_key,
-            "status": SKIP,
-            "message": "S3 Event trigger was for a non-file object",
-        }
+    )
+
+    table_name = os.environ["TABLE_NAME"]
+
+    for event in log_object["logEvents"]:
+        el = ET.fromstring(event["message"])
+        operation = el.find("./EventData/Data[@Name='operation']").text
+        object_name = el.find("./EventData/Data[@Name='ObjectName']").text
+        location_dns_name = el.find(
+            "./EventData/Data[@Name='locationDnsName']").text
+        source = el.find("./EventData/Data[@Name='source']").text
+
+    # summary = ""
+
+        summary = {}
+        if not object_name.endswith("/"):
+            mount_path = os.environ["EFS_MOUNT_PATH"]
+            definitions_path = f"{mount_path}/{os.environ['EFS_DEF_PATH']}"
+            payload_path = f"{mount_path}/{context.aws_request_id}"
+            tmp_path = f"{payload_path}-tmp"
+            set_status(source, object_name, INPROGRESS)
+            create_dir(source, object_name, payload_path)
+            create_dir(source, object_name, tmp_path)
+            download_object(location_dns_name, source,
+                            object_name, payload_path)
+            expand_if_large_archive(
+                source,
+                object_name,
+                payload_path,
+                stat(f"//{location_dns_name}{object_name}",
+                     username=os.environ["SMB_USERNAME"], password=os.environ["SMB_PASSWORD"]).st_size
+            )
+            create_dir(source, object_name, definitions_path)
+            freshclam_update(
+                source, object_name, payload_path, definitions_path
+            )
+            summary = scan(
+                source, object_name, payload_path, definitions_path, tmp_path
+            )
+            delete(payload_path)
+            delete(tmp_path)
+        else:
+            summary = {
+                "source": "serverless-clamscan",
+                "input_bucket": source,
+                "input_key": object_name,
+                "status": SKIP,
+                "message": "S3 Event trigger was for a non-file object",
+            }
     logger.info(summary)
     return summary
 
 
-def set_status(bucket, key, status):
+def set_status(source, object_name, status):
     """Set the scan-status tag of the S3 Object"""
-    old_tags = {}
+    # old_tags = {}
+    # try:
+    #     response = s3_client.get_object_tagging(Bucket=bucket, Key=key)
+    #     old_tags = {i["Key"]: i["Value"] for i in response["TagSet"]}
+    # except botocore.exceptions.ClientError as e:
+    #     logger.debug(e.response["Error"]["Message"])
+    # new_tags = {"scan-status": status}
+    # tags = {**old_tags, **new_tags}
+    # s3_client.put_object_tagging(
+    #     Bucket=bucket,
+    #     Key=key,
+    #     Tagging={
+    #         "TagSet": [
+    #             {"Key": str(k), "Value": str(v)} for k, v in tags.items()
+    #         ]
+    #     },
+    # )
+
     try:
-        response = s3_client.get_object_tagging(Bucket=bucket, Key=key)
-        old_tags = {i["Key"]: i["Value"] for i in response["TagSet"]}
+        dynamo_client.update_item(
+            TableName=os.environ["TABLE_NAME"],
+            Item={
+                'source': source,
+                'object_name': object_name,
+                'status': status,
+            }
+        )
     except botocore.exceptions.ClientError as e:
         logger.debug(e.response["Error"]["Message"])
-    new_tags = {"scan-status": status}
-    tags = {**old_tags, **new_tags}
-    s3_client.put_object_tagging(
-        Bucket=bucket,
-        Key=key,
-        Tagging={
-            "TagSet": [
-                {"Key": str(k), "Value": str(v)} for k, v in tags.items()
-            ]
-        },
-    )
     metrics.add_metric(name=status, unit="Count", value=1)
 
 
-def create_dir(input_bucket, input_key, download_path):
+def create_dir(source, object_name, download_path):
     """Creates a directory at the specified location
     if it does not already exists"""
-    sub_dir = os.path.dirname(input_key)
+    sub_dir = os.path.dirname(object_name)
     full_path = download_path
     if len(sub_dir) > 0:
         full_path = os.path.join(full_path, sub_dir)
@@ -136,28 +194,41 @@ def create_dir(input_bucket, input_key, download_path):
         try:
             os.makedirs(full_path, exist_ok=True)
         except OSError as e:
-            report_failure(input_bucket, input_key, download_path, str(e))
+            report_failure(source, object_name, download_path, str(e))
 
 
-def download_object(input_bucket, input_key, download_path):
+def download_object(location_dns_name, source, object_name, download_path):
     """Downloads the specified file from S3 to EFS"""
+
     try:
-        s3_resource.Bucket(input_bucket).download_file(
-            input_key, f"{download_path}/{input_key}"
-        )
-    except botocore.exceptions.ClientError as e:
+        with open_file(f"""\\{location_dns_name}\{object_name}""", username=os.environ["SMB_USERNAME"], password=os.environ["SMB_PASSWORD"]) as fd:
+            with open(os.path.join(download_path, object_name), "wb") as f:
+                f.write(fd.read())
+    except Exception as e:
         report_failure(
-            input_bucket,
-            input_key,
+            source,
+            object_name,
             download_path,
             e.response["Error"]["Message"],
         )
 
+    # try:
+    #     s3_resource.Bucket(input_bucket).download_file(
+    #         input_key, f"{download_path}/{input_key}"
+    #     )
+    # except botocore.exceptions.ClientError as e:
+    #     report_failure(
+    #         input_bucket,
+    #         input_key,
+    #         download_path,
+    #         e.response["Error"]["Message"],
+    #     )
 
-def expand_if_large_archive(input_bucket, input_key, download_path, byte_size):
+
+def expand_if_large_archive(source, object_name, download_path, byte_size):
     """Expand the file if it is an archival type and larger than ClamAV Max Size"""
     if byte_size > MAX_BYTES:
-        file_name = f"{download_path}/{input_key}"
+        file_name = f"{download_path}/{object_name}"
         try:
             command = ["7za", "x", "-y", f"{file_name}", f"-o{download_path}"]
             archive_summary = subprocess.run(
@@ -169,7 +240,7 @@ def expand_if_large_archive(input_bucket, input_key, download_path, byte_size):
                 raise ArchiveException(
                     f"7za exited with unexpected code: {archive_summary.returncode}."
                 )
-            delete(download_path, input_key)
+            delete(download_path, object_name)
             large_file_list = []
             for root, dirs, files in os.walk(download_path, topdown=False):
                 for name in files:
@@ -178,17 +249,17 @@ def expand_if_large_archive(input_bucket, input_key, download_path, byte_size):
                         large_file_list.append(name)
             if large_file_list:
                 raise FileTooBigException(
-                    f"Archive {input_key} contains files {large_file_list} "
+                    f"Archive {object_name} contains files {large_file_list} "
                     f"which are at greater than ClamAV max of {MAX_BYTES} bytes"
                 )
         except subprocess.CalledProcessError as e:
             report_failure(
-                input_bucket, input_key, download_path, str(e.stderr)
+                source, object_name, download_path, str(e.stderr)
             )
         except ArchiveException as e:
-            report_failure(input_bucket, input_key, download_path, e.message)
+            report_failure(source, object_name, download_path, e.message)
         except FileTooBigException as e:
-            report_failure(input_bucket, input_key, download_path, e.message)
+            report_failure(source, object_name, download_path, e.message)
     else:
         return
 
